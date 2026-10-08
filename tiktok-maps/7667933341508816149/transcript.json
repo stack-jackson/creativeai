@@ -1,0 +1,29 @@
+{
+  "language": "en",
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 2.14,
+      "text": "Thanks for watching!",
+      "no_speech_prob": 0.59,
+      "avg_logprob": -0.91,
+      "words": [
+        {
+          "w": " Thanks",
+          "start": 0.0,
+          "end": 0.3
+        },
+        {
+          "w": " for",
+          "start": 0.3,
+          "end": 0.42
+        },
+        {
+          "w": " watching!",
+          "start": 0.42,
+          "end": 2.14
+        }
+      ]
+    }
+  ]
+}

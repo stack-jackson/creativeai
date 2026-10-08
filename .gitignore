@@ -1,2 +1,5 @@
-tiktok-maps/
+tiktok-maps/*/video.mp4
+tiktok-maps/*/video.info.json
+tiktok-maps/*/anchors/*_mid.png
+tiktok-maps/*/anchors/*_end.png
 __pycache__/

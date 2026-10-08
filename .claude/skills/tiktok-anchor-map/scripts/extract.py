@@ -5,8 +5,8 @@ Uso: extract.py <url_ou_arquivo.mp4> <pasta_saida> [--threshold 0.25] [--model s
 
 Gera em <pasta_saida>:
   video.mp4, meta.json, manifest.json, transcript.json, transcript.txt
-  anchors/scene_NN_anchor.png   (1º frame limpo de cada cena = imagem âncora)
-  anchors/scene_NN_mid.png / _end.png  (para descrever o movimento)
+  anchors/scene_NN_anchor.jpg   (1º frame limpo de cada cena = imagem âncora)
+  anchors/scene_NN_mid.jpg / _end.jpg  (para descrever o movimento)
   contact_sheet.jpg             (visão geral de todas as âncoras)
 """
 import argparse, json, os, re, shutil, subprocess, sys
@@ -52,7 +52,22 @@ def scene_cuts(path, thr, dur, min_len=0.6):
 
 def grab(path, t, out):
     run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{t:.3f}", "-i", path,
-         "-frames:v", "1", out])
+         "-frames:v", "1", "-q:v", "2", out])
+
+def brightness(path):
+    r = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-vf", "scale=1:1,format=gray", "-f", "rawvideo", "-"],
+                       capture_output=True)
+    return r.stdout[0] if r.stdout else 255
+
+def grab_lit(path, t, lo, hi, step, out, min_lum=24):
+    """Pega o frame em t; se for quase preto (fade in/out), anda de step em step dentro de [lo, hi]."""
+    t = min(max(t, lo), hi)
+    while True:
+        grab(path, t, out)
+        nt = t + step
+        if brightness(out) >= min_lum or not (lo <= nt <= hi):
+            return t
+        t = nt
 
 def transcribe(path, model, lang):
     try:
@@ -60,12 +75,17 @@ def transcribe(path, model, lang):
     except ImportError:
         return None, "faster-whisper não instalado (pip install faster-whisper)"
     try:
+        import numpy as np
+        raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
+                             capture_output=True).stdout  # evita av.open (quebra com PyAV novo)
+        audio = np.frombuffer(raw, dtype=np.float32)
         m = WhisperModel(model, device="cpu", compute_type="int8")
-        segs, info = m.transcribe(path, language=None if lang == "auto" else lang,
+        segs, info = m.transcribe(audio, language=None if lang == "auto" else lang,
                                   word_timestamps=True, vad_filter=True)
         out = []
         for s in segs:
             out.append({"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip(),
+                        "no_speech_prob": round(s.no_speech_prob, 2), "avg_logprob": round(s.avg_logprob, 2),
                         "words": [{"w": w.word, "start": round(w.start, 2), "end": round(w.end, 2)} for w in (s.words or [])]})
         return {"language": info.language, "segments": out}, None
     except Exception as e:
@@ -96,7 +116,9 @@ def main():
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     if os.path.isfile(a.src):
-        video = os.path.join(a.out, "video.mp4"); shutil.copy(a.src, video)
+        video = os.path.join(a.out, "video.mp4")
+        if not (os.path.exists(video) and os.path.samefile(a.src, video)):
+            shutil.copy(a.src, video)
     else:
         video = download(a.src, a.out)
     dur, has_audio = probe(video)
@@ -106,13 +128,21 @@ def main():
     for i, (s, e) in enumerate(scenes, 1):
         # âncora = 1º frame estável após o corte (pula ~0.12s de fusão/transição)
         ta = min(s + 0.12, e - 0.05) if i > 1 else 0.0
-        files = {"anchor": (ta, f"scene_{i:02d}_anchor.png"),
-                 "mid": ((s + e) / 2, f"scene_{i:02d}_mid.png"),
-                 "end": (max(s, e - 0.15), f"scene_{i:02d}_end.png")}
-        for _, (t, fn) in files.items():
-            grab(video, t, os.path.join(ad, fn))
+        files = {"anchor": (ta, f"scene_{i:02d}_anchor.jpg"),
+                 "mid": ((s + e) / 2, f"scene_{i:02d}_mid.jpg"),
+                 "end": (max(s, e - 0.15), f"scene_{i:02d}_end.jpg")}
+        mid_t, mid_fn = files["mid"]
+        grab(video, mid_t, os.path.join(ad, mid_fn))
+        end_t, end_fn = files["end"]
+        grab(video, end_t, os.path.join(ad, end_fn))
+        ref = 0.85 * max(brightness(os.path.join(ad, mid_fn)), brightness(os.path.join(ad, end_fn)))  # fade in/out = mais escuro
+        for k in ("anchor", "end"):
+            t, fn = files[k]
+            t = grab_lit(video, t, s, e - 0.04, 0.1 if k == "anchor" else -0.1, os.path.join(ad, fn), ref)
+            files[k] = (t, fn)
+        ta = files["anchor"][0]
         manifest.append({"scene": i, "start": round(s, 2), "end": round(e, 2), "duration": round(e - s, 2),
-                         "anchor_time": round(ta, 2), **{k: f"anchors/{fn}" for k, (_, fn) in files.items()}})
+                         "anchor_time": round(ta, 2), **{k + "_img": f"anchors/{fn}" for k, (_, fn) in files.items()}})
     tr, err = (None, "ignorado (--no-transcribe)") if a.no_transcribe or not has_audio else transcribe(video, a.model, a.lang)
     if not has_audio: err = "vídeo sem trilha de áudio"
     if tr:
@@ -124,7 +154,7 @@ def main():
             sc["narration"] = " ".join(s["text"] for s in tr["segments"]
                                        if sc["start"] - 0.05 <= s["start"] < sc["end"] - 0.05 or
                                        (s["start"] < sc["start"] and s["end"] > sc["start"] + 0.5 and sc["scene"] == 1))
-    sheet_ok = contact_sheet([os.path.join(ad, f"scene_{m['scene']:02d}_anchor.png") for m in manifest[:60]],
+    sheet_ok = contact_sheet([os.path.join(ad, f"scene_{m['scene']:02d}_anchor.jpg") for m in manifest[:60]],
                              os.path.join(a.out, "contact_sheet.jpg"))
     res = {"video": video, "duration": round(dur, 2), "has_audio": has_audio, "scene_count": len(manifest),
            "threshold": a.threshold, "transcription_error": err, "contact_sheet": sheet_ok, "scenes": manifest}
